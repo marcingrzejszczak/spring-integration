@@ -21,6 +21,7 @@ import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.beans.factory.support.BeanDefinitionBuilder;
 import org.springframework.beans.factory.support.BeanDefinitionRegistry;
 import org.springframework.context.annotation.ImportBeanDefinitionRegistrar;
+import org.springframework.core.observability.event.Recorder;
 import org.springframework.core.type.AnnotationMetadata;
 import org.springframework.util.ClassUtils;
 
@@ -54,7 +55,8 @@ public class MicrometerMetricsCaptorRegistrar implements ImportBeanDefinitionReg
 
 			registry.registerBeanDefinition(MicrometerMetricsCaptor.MICROMETER_CAPTOR_NAME,
 					BeanDefinitionBuilder.genericBeanDefinition(MicrometerMetricsCaptor.class,
-							() -> new MicrometerMetricsCaptor(beanFactory.getBeanProvider(MeterRegistry.class)))
+							() -> MicrometerMetricsCaptor.build(beanFactory.getBeanProvider(MeterRegistry.class),
+									beanFactory.getBeanProvider(Recorder.class)))
 							.setRole(BeanDefinition.ROLE_INFRASTRUCTURE)
 							.getBeanDefinition());
 		}

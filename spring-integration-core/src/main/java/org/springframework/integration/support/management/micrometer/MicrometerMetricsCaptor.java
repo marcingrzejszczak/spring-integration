@@ -1,5 +1,5 @@
 /*
- * Copyright 2018-2020 the original author or authors.
+ * Copyright 2018-2021 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 package org.springframework.integration.support.management.micrometer;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.ToDoubleFunction;
 
@@ -23,6 +25,11 @@ import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.support.GenericApplicationContext;
+import org.springframework.core.observability.event.Recorder;
+import org.springframework.core.observability.event.interval.IntervalEvent;
+import org.springframework.core.observability.event.interval.IntervalRecording;
+import org.springframework.core.observability.event.tag.Cardinality;
+import org.springframework.core.observability.event.tag.Tag;
 import org.springframework.integration.support.management.metrics.CounterFacade;
 import org.springframework.integration.support.management.metrics.GaugeFacade;
 import org.springframework.integration.support.management.metrics.MeterFacade;
@@ -52,6 +59,10 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 
 	private MeterRegistry meterRegistry;
 
+	private Recorder<?> recorder;
+
+	private ObjectProvider<Recorder> recorderProvider;
+
 	private ObjectProvider<MeterRegistry> meterRegistryProvider;
 
 	public MicrometerMetricsCaptor(MeterRegistry meterRegistry) {
@@ -63,6 +74,19 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 		this.meterRegistryProvider = meterRegistryProvider;
 	}
 
+	static MicrometerMetricsCaptor build(ObjectProvider<MeterRegistry> meterRegistryProvider,
+			ObjectProvider<Recorder> recorderProvider) {
+		MicrometerMetricsCaptor captor = new MicrometerMetricsCaptor(meterRegistryProvider);
+		captor.recorderProvider = recorderProvider;
+		return captor;
+	}
+
+	static MicrometerMetricsCaptor build(MeterRegistry meterRegistry, ObjectProvider<Recorder> recorderProvider) {
+		MicrometerMetricsCaptor captor = new MicrometerMetricsCaptor(meterRegistry);
+		captor.recorderProvider = recorderProvider;
+		return captor;
+	}
+
 	public MeterRegistry getMeterRegistry() {
 		if (this.meterRegistry == null) {
 			this.meterRegistry = this.meterRegistryProvider.getIfUnique();
@@ -70,9 +94,17 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 		return this.meterRegistry;
 	}
 
+	public Recorder<?> getRecorder() {
+		if (this.recorder == null) {
+			this.recorder = this.recorderProvider.getIfUnique();
+		}
+		return this.recorder;
+	}
+
 	@Override
 	public TimerBuilder timerBuilder(String name) {
-		return new MicroTimerBuilder(getMeterRegistry(), name);
+		return new RecorderTimerBuilder(getRecorder(), name);
+//		return new MicroTimerBuilder(getMeterRegistry(), name);
 	}
 
 	@Override
@@ -87,7 +119,8 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 
 	@Override
 	public SampleFacade start() {
-		return new MicroSample(Timer.start(getMeterRegistry()));
+		return new RecorderSample(getRecorder());
+//		return new MicroSample(Timer.start(getMeterRegistry()));
 	}
 
 	@Override
@@ -106,12 +139,14 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 	@Deprecated
 	public static MetricsCaptor loadCaptor(ApplicationContext applicationContext) {
 		try {
+			
 			MeterRegistry registry = applicationContext.getBean(MeterRegistry.class);
 			if (applicationContext instanceof GenericApplicationContext
 					&& !applicationContext.containsBean(MICROMETER_CAPTOR_NAME)) {
 				((GenericApplicationContext) applicationContext).registerBean(MICROMETER_CAPTOR_NAME,
 						MicrometerMetricsCaptor.class,
-						() -> new MicrometerMetricsCaptor(registry));
+						() -> MicrometerMetricsCaptor.build(registry,
+								applicationContext.getBeanProvider(Recorder.class)));
 			}
 			return applicationContext.getBean(MICROMETER_CAPTOR_NAME, MetricsCaptor.class);
 		}
@@ -132,6 +167,26 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 		@Override
 		public void stop(TimerFacade timer) {
 			this.sample.stop(((AbstractMeter<Timer>) timer).getMeter());
+		}
+
+	}
+
+	private static class RecorderSample implements SampleFacade {
+
+		private final Recorder<?> recorder;
+
+		private final IntervalRecording<?> sample;
+
+		RecorderSample(Recorder<?> recorder) {
+			this.recorder = recorder;
+			this.sample = recorder.recordingFor((IntervalEvent) () -> "test").start();
+		}
+
+		@SuppressWarnings("unchecked")
+		@Override
+		public void stop(TimerFacade timer) {
+			// TODO: The API needs to change
+			this.sample.stop();
 		}
 
 	}
@@ -162,6 +217,52 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 		@Override
 		public MicroTimer build() {
 			return new MicroTimer(this.builder.register(this.meterRegistry), this.meterRegistry);
+		}
+
+	}
+
+	protected static class RecorderTimerBuilder implements TimerBuilder {
+
+		private final Recorder<?> recorder;
+		private final String name;
+		private String description;
+		private final List<Tag> tags = new ArrayList<>();
+
+		RecorderTimerBuilder(Recorder<?> recorder, String name) {
+			this.recorder = recorder;
+			this.name = name;
+		}
+
+		@Override
+		public RecorderTimerBuilder tag(String key, String value) {
+			this.tags.add(Tag.of(key, value, Cardinality.LOW));
+			return this;
+		}
+
+		@Override
+		public RecorderTimerBuilder description(String desc) {
+			this.description = desc;
+			return this;
+		}
+
+		@Override
+		public RecorderTimer build() {
+			IntervalRecording<?> recording = this.recorder.recordingFor(new IntervalEvent() {
+
+				@Override
+				public String getLowCardinalityName() {
+					return name;
+				}
+
+				@Override
+				public String getDescription() {
+					return description;
+				}
+
+			});
+			this.tags.forEach(recording::tag);
+			recording.start();
+			return new RecorderTimer(recording);
 		}
 
 	}
@@ -223,6 +324,34 @@ public class MicrometerMetricsCaptor implements MetricsCaptor {
 				return false;
 			}
 			return this.timer.equals(((MicroTimer) obj).timer);
+		}
+
+	}
+
+	protected static class RecorderTimer implements TimerFacade {
+
+		private final IntervalRecording<?> timer;
+
+		protected RecorderTimer(IntervalRecording<?> timer) {
+			this.timer = timer;
+		}
+
+		@Override
+		public void record(long time, TimeUnit unit) {
+			this.timer.stop(unit.toNanos(time));
+		}
+
+		@Override
+		public int hashCode() {
+			return this.timer.hashCode();
+		}
+
+		@Override
+		public boolean equals(Object obj) {
+			if (obj == null || !getClass().equals(obj.getClass())) {
+				return false;
+			}
+			return this.timer.equals(((RecorderTimer) obj).timer);
 		}
 
 	}
